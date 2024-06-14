@@ -266,8 +266,8 @@ xlnt::detail::Cell parse_cell(xlnt::row_t row_arg, xml::parser *parser, std::uno
         case xml::parser::start_attribute:
         case xml::parser::end_attribute:
         case xml::parser::eof:
-        default: {
-            throw xlnt::exception("unexcpected XML parsing event");
+        default: { 
+            throw xlnt::exception("unexpected XML parsing event");
         }
         }
         // Prevents unhandled exceptions from being triggered.
@@ -344,7 +344,7 @@ std::pair<xlnt::row_properties, int> parse_row(xml::parser *parser, xlnt::detail
         case xml::parser::end_attribute:
         case xml::parser::eof:
         default: {
-            throw xlnt::exception("unexcpected XML parsing event");
+            throw xlnt::exception("unexpected XML parsing event");
         }
         }
     }
@@ -382,7 +382,7 @@ Sheet_Data parse_sheet_data(xml::parser *parser, xlnt::detail::number_serialiser
         case xml::parser::end_attribute:
         case xml::parser::eof:
         default: {
-            throw xlnt::exception("unexcpected XML parsing event");
+            throw xlnt::exception("unexpected XML parsing event");
         }
         }
     }
@@ -534,7 +534,7 @@ std::string xlsx_consumer::read_worksheet_begin(const std::string &rel_id)
     expect_start_element(qn("spreadsheetml", "worksheet"), xml::content::complex); // CT_Worksheet
     skip_attributes({qn("mc", "Ignorable")});
     
-    read_defined_names(ws, defined_names_);
+    read_defined_names(ws, ws.d_->defined_names_);
 
     while (in_element(qn("spreadsheetml", "worksheet")))
     {
@@ -817,6 +817,8 @@ std::string xlsx_consumer::read_worksheet_begin(const std::string &rel_id)
                     props.custom_width = custom;
                     props.best_fit = best_fit;
                     ws.add_column_properties(column, props);
+                    //add by tzg
+                    break;
                 }
             }
         }
@@ -2082,16 +2084,61 @@ void xlsx_consumer::read_office_document(const std::string &content_type) // CT_
 
                 defined_name name;
                 name.name = parser().attribute("name");
-                name.sheet_id = parser().attribute<std::size_t>("localSheetId");
-                name.hidden = false;
+
+                if (parser().attribute_present("comment"))
+                {
+                    name.comment = parser().attribute<std::string>("comment");
+                }
+
+                if (parser().attribute_present("customMenu"))
+                {
+                    name.custom_menu = parser().attribute<std::string>("customMenu");
+                }
+
+                if (parser().attribute_present("description"))
+                {
+                    name.description = parser().attribute<std::string>("description");
+                }
+
+                if (parser().attribute_present("help"))
+                {
+                    name.help = parser().attribute<std::string>("help");
+                }
+
+                if (parser().attribute_present("statusBar"))
+                {
+                    name.status_bar = parser().attribute<std::string>("statusBar");
+                }
+
+                if (parser().attribute_present("localSheetId"))
+                {
+                    name.sheet_id = parser().attribute<std::size_t>("localSheetId");
+                }
+                
                 if (parser().attribute_present("hidden"))
                 {
                     name.hidden = is_true(parser().attribute("hidden"));
                 }
+
+                if (parser().attribute_present("function"))
+                {
+                    name.function = is_true(parser().attribute("function"));
+                }
+
+                if (parser().attribute_present("functionGroupId"))
+                {
+                    name.function_group_id = parser().attribute<std::size_t>("functionGroupId");
+                }
+
+                if (parser().attribute_present("shortcutKey"))
+                {
+                    name.shortcut_key = parser().attribute<std::string>("shortcutKey");
+                }
+
                 parser().attribute_map(); // skip remaining attributes
                 name.value = read_text();
-                defined_names_.push_back(name);
-                
+                target_.d_->defined_names_.push_back(name);
+
                 expect_end_element(qn("spreadsheetml", "definedName"));
             }
         }
@@ -2195,6 +2242,7 @@ void xlsx_consumer::read_office_document(const std::string &content_type) // CT_
         }
     }
 
+    std::vector<defined_name> workbook_names;
     for (auto worksheet_rel : manifest().relationships(workbook_path, relationship_type::worksheet))
     {
         auto title = std::find_if(target_.d_->sheet_title_rel_id_map_.begin(),
@@ -2203,7 +2251,7 @@ void xlsx_consumer::read_office_document(const std::string &content_type) // CT_
                 return p.second == worksheet_rel.id();
             })->first;
 
-        auto id = sheet_title_id_map_[title];
+        auto id = sheet_title_id_map_[title]; // 1-indexed
         auto index = sheet_title_index_map_[title];
 
         auto insertion_iter = target_.d_->worksheets_.begin();
@@ -2215,11 +2263,34 @@ void xlsx_consumer::read_office_document(const std::string &content_type) // CT_
 
         current_worksheet_ = &*target_.d_->worksheets_.emplace(insertion_iter, &target_, id, title);
 
+        // If there's any defined names that are worksheet specific, move them here.
+        for (std::size_t i = 0; i < target_.d_->defined_names_.size(); i++)
+        {
+            const auto &name = target_.d_->defined_names_[i];
+            if (name.sheet_id.is_set())
+            {
+                const auto target_id = name.sheet_id.get();
+                if (target_id == index)
+                {
+                    // It's a match, remove it from the workbook and add it to the sheet
+                    current_worksheet_->defined_names_.push_back(name);
+                }
+            }
+            else
+            {
+                // Name is global and belongs to the workbook, if i'ts not already added
+                if (std::find(workbook_names.begin(), workbook_names.end(), name) == workbook_names.end())
+                    workbook_names.push_back(name);
+            }
+        }
+
         if (!streaming_)
         {
             read_part({workbook_rel, worksheet_rel});
         }
     }
+    // Update the workbook with the new defined names
+    target_.d_->defined_names_ = workbook_names;
 }
 
 // Write Workbook Relationship Target Parts
@@ -2317,7 +2388,12 @@ void xlsx_consumer::read_stylesheet()
         if (current_style_element == qn("spreadsheetml", "borders"))
         {
             auto &borders = stylesheet.borders;
-            auto count = parser().attribute<std::size_t>("count");
+            optional<std::size_t> count;
+            if (parser().attribute_present("count"))
+            {
+                count = parser().attribute<std::size_t>("count");
+                borders.reserve(count.get());
+            }
 
             while (in_element(qn("spreadsheetml", "borders")))
             {
@@ -2370,15 +2446,22 @@ void xlsx_consumer::read_stylesheet()
                 expect_end_element(qn("spreadsheetml", "border"));
             }
 
-            if (count != borders.size())
+#ifdef THROW_ON_INVALID_XML
+            if (count.is_set() && count != borders.size())
             {
                 throw xlnt::exception("border counts don't match");
             }
+#endif
         }
         else if (current_style_element == qn("spreadsheetml", "fills"))
         {
             auto &fills = stylesheet.fills;
-            auto count = parser().attribute<std::size_t>("count");
+            optional<std::size_t> count;
+            if (parser().attribute_present("count"))
+            {
+                count = parser().attribute<std::size_t>("count");
+                fills.reserve(count.get());
+            }
 
             while (in_element(qn("spreadsheetml", "fills")))
             {
@@ -2455,15 +2538,22 @@ void xlsx_consumer::read_stylesheet()
                 expect_end_element(qn("spreadsheetml", "fill"));
             }
 
-            if (count != fills.size())
+#ifdef THROW_ON_INVALID_XML
+            if (count.is_set() && count != fills.size())
             {
                 throw xlnt::exception("counts don't match");
             }
+#endif
         }
         else if (current_style_element == qn("spreadsheetml", "fonts"))
         {
             auto &fonts = stylesheet.fonts;
-            auto count = parser().attribute<std::size_t>("count", 0);
+            optional<std::size_t> count;
+            if (parser().attribute_present("count"))
+            {
+                count = parser().attribute<std::size_t>("count");
+                fonts.reserve(count.get());
+            }
 
             if (parser().attribute_present(qn("x14ac", "knownFonts")))
             {
@@ -2598,15 +2688,22 @@ void xlsx_consumer::read_stylesheet()
                 expect_end_element(qn("spreadsheetml", "font"));
             }
 
-            if (count != stylesheet.fonts.size())
+#ifdef THROW_ON_INVALID_XML
+            if (count.is_set() && count != stylesheet.fonts.size())
             {
-                // throw xlnt::exception("counts don't match");
+                throw xlnt::exception("counts don't match");
             }
+#endif
         }
         else if (current_style_element == qn("spreadsheetml", "numFmts"))
         {
             auto &number_formats = stylesheet.number_formats;
-            auto count = parser().attribute<std::size_t>("count");
+            optional<std::size_t> count;
+            if (parser().attribute_present("count"))
+            {
+                count = parser().attribute<std::size_t>("count");
+                number_formats.reserve(count.get());
+            }
 
             while (in_element(qn("spreadsheetml", "numFmts")))
             {
@@ -2629,14 +2726,21 @@ void xlsx_consumer::read_stylesheet()
                 number_formats.push_back(nf);
             }
 
-            if (count != number_formats.size())
+#ifdef THROW_ON_INVALID_XML
+            if (count.is_set() && count != number_formats.size())
             {
                 throw xlnt::exception("counts don't match");
             }
+#endif
         }
         else if (current_style_element == qn("spreadsheetml", "cellStyles"))
         {
-            auto count = parser().attribute<std::size_t>("count");
+            optional<std::size_t> count;
+            if (parser().attribute_present("count"))
+            {
+                count = parser().attribute<std::size_t>("count");
+                styles.reserve(count.get());
+            }
 
             while (in_element(qn("spreadsheetml", "cellStyles")))
             {
@@ -2665,16 +2769,30 @@ void xlsx_consumer::read_stylesheet()
                 expect_end_element(qn("spreadsheetml", "cellStyle"));
             }
 
-            if (count != styles.size())
+#ifdef THROW_ON_INVALID_XML
+            if (count.is_set() && count != styles.size())
             {
                 throw xlnt::exception("counts don't match");
             }
+#endif
         }
         else if (current_style_element == qn("spreadsheetml", "cellStyleXfs")
             || current_style_element == qn("spreadsheetml", "cellXfs"))
         {
             auto in_style_records = current_style_element.name() == "cellStyleXfs";
-            auto count = parser().attribute<std::size_t>("count");
+            optional<std::size_t> count;
+            if (parser().attribute_present("count"))
+            {
+                count = parser().attribute<std::size_t>("count");
+                if (in_style_records)
+                {
+                    style_records.reserve(count.get());
+                }
+                else
+                {
+                    format_records.reserve(count.get());
+                }
+            }
 
             while (in_element(current_style_element))
             {
@@ -2803,15 +2921,21 @@ void xlsx_consumer::read_stylesheet()
                 expect_end_element(qn("spreadsheetml", "xf"));
             }
 
-            if ((in_style_records && count != style_records.size())
-                || (!in_style_records && count != format_records.size()))
+#ifdef THROW_ON_INVALID_XML
+            if (count.is_set() && ((in_style_records && count != style_records.size())
+                || (!in_style_records && count != format_records.size())))
             {
                 throw xlnt::exception("counts don't match");
             }
+#endif
         }
         else if (current_style_element == qn("spreadsheetml", "dxfs"))
         {
-            auto count = parser().attribute<std::size_t>("count");
+            optional<std::size_t> count;
+            if (parser().attribute_present("count"))
+            {
+                count = parser().attribute<std::size_t>("count");
+            }
             std::size_t processed = 0;
 
             while (in_element(current_style_element))
@@ -2822,17 +2946,23 @@ void xlsx_consumer::read_stylesheet()
                 ++processed;
             }
 
-            if (count != processed)
+#ifdef THROW_ON_INVALID_XML
+            if (count.is_set() && count != processed)
             {
                 throw xlnt::exception("counts don't match");
             }
+#endif
         }
         else if (current_style_element == qn("spreadsheetml", "tableStyles"))
         {
             skip_attribute("defaultTableStyle");
             skip_attribute("defaultPivotStyle");
 
-            auto count = parser().attribute<std::size_t>("count");
+            optional<std::size_t> count;
+            if (parser().attribute_present("count"))
+            {
+                count = parser().attribute<std::size_t>("count");
+            }
             std::size_t processed = 0;
 
             while (in_element(qn("spreadsheetml", "tableStyles")))
@@ -2843,10 +2973,12 @@ void xlsx_consumer::read_stylesheet()
                 ++processed;
             }
 
-            if (count != processed)
+#ifdef THROW_ON_INVALID_XML
+            if (count.is_set() && count != processed)
             {
                 throw xlnt::exception("counts don't match");
             }
+#endif
         }
         else if (current_style_element == qn("spreadsheetml", "extLst"))
         {
